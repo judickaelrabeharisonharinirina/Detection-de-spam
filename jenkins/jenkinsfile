@@ -5,11 +5,11 @@ pipeline {
         // ---- CONFIGURATION DES USER / IMAGES ----
         DOCKER_USER      = 'judickael040'
         IMAGE_NAME       = 'spam_detection'
-        IMAGE_TAG        = "${BUILD_NUMBER}" // Utilise dynamiquement le numéro de build actuel
+        IMAGE_TAG        = "${BUILD_NUMBER}" 
 
         // ---- CONFIGURATION DES CREDENTIALS ID (JENKINS) ----
         REGISTRY_CRED_ID = 'dockerhub-credentials-id'
-        COSIGN_CRED_ID   = 'cosign-private-key' // Doit correspondre à ton Secret File Jenkins
+        COSIGN_CRED_ID   = 'cosign-private-key' 
 
         // ---- ENVIRONNEMENTS ----
         ENV_TEST    = 'Testing-Environment'
@@ -38,18 +38,17 @@ pipeline {
         // ==========================================
         stage('Setup Environment') {
             steps {
-                echo "Configuration de l'environnement virtuel Python..."
+                echo "Configuration de l'environnement virtuel Python via un conteneur temporaire..."
                 sh '''
-                # 1. Création du venv sans ensurepip pour éviter le crash Linux
-                python3 -m venv venv --without-pip
-                
-                # 2. Téléchargement et installation manuelle de pip dans le venv
-                curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-                venv/bin/python3 get-pip.py
-                
-                # 3. Mise à jour de pip et installation des dépendances du projet
-                venv/bin/pip install --upgrade pip
-                venv/bin/pip install -r Codes/docker/requirements.txt
+                # Utilisation de l'UID/GID Jenkins courant pour éviter le crash lié aux permissions sur le volume
+                docker run --rm \
+                  --user $(id -u):$(id -g) \
+                  -v $(pwd):/app -w /app \
+                  python:3.13-slim sh -c "
+                    python3 -m venv venv && \
+                    ./venv/bin/pip install --upgrade pip && \
+                    ./venv/bin/pip install -r docker/requirements.txt
+                  "
                 '''
             }
         }
@@ -62,7 +61,7 @@ pipeline {
                 sh "ls -R ."
                 echo "Lancement de l'entraînement du modèle avec suivi MLflow..."
                 sh """
-                venv/bin/python3 Codes/src/mlflow_tracking.py
+                venv/bin/python3 src/predict.py
                 """
             }
         }
@@ -74,7 +73,7 @@ pipeline {
             steps {
                 echo "Construction de l'image Docker avec le Dockerfile spécifié..."
                 sh """
-                docker build -t ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} -f Codes/docker/Dockerfile .
+                docker build -t ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} -f docker/Dockerfile .
                 docker tag ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} ${DOCKER_USER}/${IMAGE_NAME}:latest
                 """
             }
@@ -86,7 +85,6 @@ pipeline {
         stage('Trivy Scan') {
             steps {
                 echo 'Analyse de sécurité avec Trivy...'
-                // Scan dynamique basé sur l'image qui vient d'être construite
                 sh """
                     docker run --rm \
                     -v /var/run/docker.sock:/var/run/docker.sock \
@@ -119,10 +117,8 @@ pipeline {
             
                     echo 'Signature de l\'image avec Cosign...'
                     sh """
-                        # 1. On stocke le contenu de la clé dans une variable Shell
                         COSIGN_PRIVATE_KEY=\$(cat \$COSIGN_KEY_PATH)
 
-                        # 2. On passe les identifiants de registre RECONNUS par Cosign
                         docker run --rm \
                           -e COSIGN_PASSWORD=\$COSIGN_PASSWORD \
                           -e COSIGN_KEY="\$COSIGN_PRIVATE_KEY" \
@@ -147,14 +143,10 @@ pipeline {
             steps {
                 echo "Installation des dépendances et déploiement via Ansible..."
                 sh """
-                # 1. Installation des prérequis dans le venv
-                venv/bin/pip install ansible-core docker requests
+                ./venv/bin/pip install ansible-core docker requests
+                ./venv/bin/ansible-galaxy collection install community.docker
 
-                # 2. Installation de la collection Ansible pour Docker
-                venv/bin/ansible-galaxy collection install community.docker
-
-                # 3. Exécution du playbook en forçant l'interpréteur Python du venv
-                venv/bin/ansible-playbook ansible/deploy.yml \
+                ./venv/bin/ansible-playbook ansible/deploy.yml \
                 -i ansible/hosts.ini \
                 --extra-vars "docker_image_user=${DOCKER_USER} docker_image_name=${IMAGE_NAME} docker_image_tag=${IMAGE_TAG} ansible_python_interpreter=\$(pwd)/venv/bin/python3"
                 """
