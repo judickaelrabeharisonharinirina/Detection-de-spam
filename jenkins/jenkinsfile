@@ -29,7 +29,7 @@ pipeline {
         stage('Git Clone Project') {
             steps {
                 echo "Récupération du projet depuis GitHub..."
-                git branch: 'main', url: 'https://github.com/judickaelrabeharisonharinirina/spam-detection-mlops.git'
+                git branch: 'main', url: 'https://github.com/judickaelrabeharisonharinirina/Detection-de-spam.git'
             }
         }
 
