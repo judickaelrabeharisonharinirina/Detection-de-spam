@@ -1,0 +1,24 @@
+---
+- name: Deploy Spam Detection App
+  hosts: prod
+  become: false
+
+  tasks:
+    - name: Stop and remove container if exists
+      community.docker.docker_container:
+        name: "{{ docker_image_name }}"
+        state: absent
+
+    - name: Run new container with an automatic free port
+      community.docker.docker_container:
+        name: "{{ docker_image_name }}"
+        image: "{{ docker_image_user }}/{{ docker_image_name }}:{{ docker_image_tag }}"
+        state: started
+        restart_policy: always
+        ports:
+          - "0:8501" # 👈 Le port interne du conteneur est maintenant 8501
+      register: docker_info
+
+    - name: Afficher le port qui a été attribué
+      debug:
+        msg: "L'application est en ligne sur le port : {{ docker_info.container.NetworkSettings.Ports['8501/tcp'][0].HostPort }}" # 👈 Modifié ici aussi !

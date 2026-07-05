@@ -1,0 +1,13 @@
+fastapi==0.111.0
+uvicorn
+pydantic
+scikit-learn
+mlflow
+streamlit
+requests
+nltk
+seaborn
+matplotlib
+pandas
+numpy
+prometheus_client

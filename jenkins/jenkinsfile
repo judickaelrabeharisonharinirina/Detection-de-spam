@@ -1,0 +1,183 @@
+pipeline {
+    agent any
+
+    environment {
+        // ---- CONFIGURATION DES USER / IMAGES ----
+        DOCKER_USER      = 'judickael040'
+        IMAGE_NAME       = 'spam_detection'
+        IMAGE_TAG        = "${BUILD_NUMBER}" // Utilise dynamiquement le numéro de build actuel
+
+        // ---- CONFIGURATION DES CREDENTIALS ID (JENKINS) ----
+        REGISTRY_CRED_ID = 'dockerhub-credentials-id'
+        COSIGN_CRED_ID   = 'cosign-private-key' // Doit correspondre à ton Secret File Jenkins
+
+        // ---- ENVIRONNEMENTS ----
+        ENV_TEST    = 'Testing-Environment'
+        ENV_RAPPORT = 'Security-Reports'
+        ENV_PROD    = 'Production-Environment'
+        
+        // ---- CONFIGURATION MLFLOW ----
+        MLFLOW_TRACKING_URI = 'http://localhost:5000'
+        MLFLOW_ALLOW_FILE_STORE = 'true'
+    }
+
+    stages {
+
+        // ==========================================
+        // STAGE 1 : GIT CLONE
+        // ==========================================
+        stage('Git Clone Project') {
+            steps {
+                echo "Récupération du projet depuis GitHub..."
+                git branch: 'main', url: 'https://github.com/judickaelrabeharisonharinirina/spam-detection-mlops.git'
+            }
+        }
+
+        // ==========================================
+        // STAGE 2 : SETUP ENV
+        // ==========================================
+        stage('Setup Environment') {
+            steps {
+                echo "Configuration de l'environnement virtuel Python..."
+                sh '''
+                # 1. Création du venv sans ensurepip pour éviter le crash Linux
+                python3 -m venv venv --without-pip
+                
+                # 2. Téléchargement et installation manuelle de pip dans le venv
+                curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+                venv/bin/python3 get-pip.py
+                
+                # 3. Mise à jour de pip et installation des dépendances du projet
+                venv/bin/pip install --upgrade pip
+                venv/bin/pip install -r Codes/docker/requirements.txt
+                '''
+            }
+        }
+
+        // ==========================================
+        // STAGE 3 : ENTRAÎNEMENT ML + CONFIG MLFLOW
+        // ==========================================
+        stage('ML Training & MLflow Tracking') {
+            steps {
+                sh "ls -R ."
+                echo "Lancement de l'entraînement du modèle avec suivi MLflow..."
+                sh """
+                venv/bin/python3 Codes/src/mlflow_tracking.py
+                """
+            }
+        }
+
+        // ==========================================
+        // STAGE 4 : DOCKER BUILD
+        // ==========================================
+        stage('Docker Build') {
+            steps {
+                echo "Construction de l'image Docker avec le Dockerfile spécifié..."
+                sh """
+                docker build -t ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} -f Codes/docker/Dockerfile .
+                docker tag ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} ${DOCKER_USER}/${IMAGE_NAME}:latest
+                """
+            }
+        }
+
+        // ==========================================
+        // STAGE 5 : TRIVY SCAN
+        // ==========================================
+        stage('Trivy Scan') {
+            steps {
+                echo 'Analyse de sécurité avec Trivy...'
+                // Scan dynamique basé sur l'image qui vient d'être construite
+                sh """
+                    docker run --rm \
+                    -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v \$(pwd):/root/.cache/ \
+                    aquasec/trivy:latest image \
+                    --format template --template "@contrib/html.tpl" \
+                    -o /root/.cache/trivy-report.html \
+                    ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}
+                """
+            }
+        }
+
+        // ==========================================
+        // STAGE 6 : PUSH SUR DOCKERHUB & SIGNATURE COSIGN
+        // ==========================================
+        stage('Push & Sign') {
+            steps {
+                withCredentials([
+                    usernamePassword(credentialsId: "${REGISTRY_CRED_ID}", usernameVariable: 'DOCKER_USER_ENV', passwordVariable: 'DOCKER_PASS'),
+                    file(credentialsId: "${COSIGN_CRED_ID}", variable: 'COSIGN_KEY_PATH'),
+                    string(credentialsId: 'cosign-password', variable: 'COSIGN_PASSWORD')
+                ]) {
+            
+                    echo 'Connexion à Docker Hub...'
+                    sh "echo \$DOCKER_PASS | docker login -u \$DOCKER_USER_ENV --password-stdin"
+             
+                    echo 'Push des images Docker...'
+                    sh "docker push ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}"
+                    sh "docker push ${DOCKER_USER}/${IMAGE_NAME}:latest"
+            
+                    echo 'Signature de l\'image avec Cosign...'
+                    sh """
+                        # 1. On stocke le contenu de la clé dans une variable Shell
+                        COSIGN_PRIVATE_KEY=\$(cat \$COSIGN_KEY_PATH)
+
+                        # 2. On passe les identifiants de registre RECONNUS par Cosign
+                        docker run --rm \
+                          -e COSIGN_PASSWORD=\$COSIGN_PASSWORD \
+                          -e COSIGN_KEY="\$COSIGN_PRIVATE_KEY" \
+                          -e COSIGN_REGISTRY_USERNAME=\$DOCKER_USER_ENV \
+                          -e COSIGN_REGISTRY_PASSWORD=\$DOCKER_PASS \
+                          gcr.io/projectsigstore/cosign:v2.2.3 sign \
+                          --key env://COSIGN_KEY \
+                          --tlog-upload=false \
+                          --yes \
+                          ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}
+                    """
+            
+                    echo 'Signature réussie ! ✅'
+                }
+            }
+        }
+
+        // ==========================================
+        // STAGE 7 : DÉPLOIEMENT EN PRODUCTION (ANSIBLE)
+        // ==========================================
+        stage('Deploy with Ansible') {
+            steps {
+                echo "Installation des dépendances et déploiement via Ansible..."
+                sh """
+                # 1. Installation des prérequis dans le venv
+                venv/bin/pip install ansible-core docker requests
+
+                # 2. Installation de la collection Ansible pour Docker
+                venv/bin/ansible-galaxy collection install community.docker
+
+                # 3. Exécution du playbook en forçant l'interpréteur Python du venv
+                venv/bin/ansible-playbook ansible/deploy.yml \
+                -i ansible/hosts.ini \
+                --extra-vars "docker_image_user=${DOCKER_USER} docker_image_name=${IMAGE_NAME} docker_image_tag=${IMAGE_TAG} ansible_python_interpreter=\$(pwd)/venv/bin/python3"
+                """
+            }
+        }
+    }
+
+    // ==========================================
+    // ACTIONS POST-EXECUTION
+    // ==========================================
+    post {
+        always {
+            echo "Nettoyage de la session..."
+            sh 'docker logout || true'
+            sh 'rm -f get-pip.py'
+        }
+
+        success {
+            echo "SUCCESS 🚀 L'application Spam Detection a été entraînée, scannée, signée et déployée !"
+        }
+
+        failure {
+            echo "FAILED ❌ Le pipeline a échoué. Regarde les logs de l'étape en rouge."
+        }
+    }
+}
