@@ -38,17 +38,13 @@ pipeline {
         // ==========================================
         stage('Setup Environment') {
             steps {
-                echo "Configuration de l'environnement virtuel Python via un conteneur temporaire..."
+                echo "Configuration de l'environnement virtuel Python..."
                 sh '''
-                # Utilisation de l'UID/GID Jenkins courant pour éviter le crash lié aux permissions sur le volume
-                docker run --rm \
-                  --user $(id -u):$(id -g) \
-                  -v $(pwd):/app -w /app \
-                  python:3.13-slim sh -c "
-                    python3 -m venv venv && \
-                    ./venv/bin/pip install --upgrade pip && \
-                    ./venv/bin/pip install -r docker/requirements.txt
-                  "
+                python3 -m venv venv --without-pip
+                curl -sS https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+                venv/bin/python3 get-pip.py
+                venv/bin/pip install --upgrade pip
+                venv/bin/pip install -r docker/requirements.txt
                 '''
             }
         }
@@ -67,11 +63,11 @@ pipeline {
         }
 
         // ==========================================
-        // STAGE 4 : DOCKER BUILD
+        // STAGE 4 : DOCKER BUILD (Direct et natif)
         // ==========================================
         stage('Docker Build') {
             steps {
-                echo "Construction de l'image Docker avec le Dockerfile spécifié..."
+                echo "Construction de l'image Docker..."
                 sh """
                 docker build -t ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} -f docker/Dockerfile .
                 docker tag ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} ${DOCKER_USER}/${IMAGE_NAME}:latest
@@ -80,25 +76,24 @@ pipeline {
         }
 
         // ==========================================
-        // STAGE 5 : TRIVY SCAN
+        // STAGE 5 : TRIVY SCAN (Version Windows robuste)
         // ==========================================
         stage('Trivy Scan') {
             steps {
                 echo 'Analyse de sécurité avec Trivy...'
+                // On retire le montage de volume buggé sous Windows (-v) et on redirige directement le flux HTML (>)
                 sh """
                     docker run --rm \
                     -v /var/run/docker.sock:/var/run/docker.sock \
-                    -v \$(pwd):/root/.cache/ \
                     aquasec/trivy:latest image \
                     --format template --template "@contrib/html.tpl" \
-                    -o /root/.cache/trivy-report.html \
-                    ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}
+                    ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG} > trivy-report.html
                 """
             }
         }
 
         // ==========================================
-        // STAGE 6 : PUSH SUR DOCKERHUB & SIGNATURE COSIGN
+        // STAGE 6 : PUSH & SIGN
         // ==========================================
         stage('Push & Sign') {
             steps {
@@ -130,7 +125,6 @@ pipeline {
                           --yes \
                           ${DOCKER_USER}/${IMAGE_NAME}:${IMAGE_TAG}
                     """
-            
                     echo 'Signature réussie ! ✅'
                 }
             }
@@ -143,10 +137,10 @@ pipeline {
             steps {
                 echo "Installation des dépendances et déploiement via Ansible..."
                 sh """
-                ./venv/bin/pip install ansible-core docker requests
-                ./venv/bin/ansible-galaxy collection install community.docker
+                venv/bin/pip install ansible-core docker requests
+                venv/bin/ansible-galaxy collection install community.docker
 
-                ./venv/bin/ansible-playbook ansible/deploy.yml \
+                venv/bin/ansible-playbook ansible/deploy.yml \
                 -i ansible/hosts.ini \
                 --extra-vars "docker_image_user=${DOCKER_USER} docker_image_name=${IMAGE_NAME} docker_image_tag=${IMAGE_TAG} ansible_python_interpreter=\$(pwd)/venv/bin/python3"
                 """
@@ -154,22 +148,19 @@ pipeline {
         }
     }
 
-    // ==========================================
-    // ACTIONS POST-EXECUTION
-    // ==========================================
     post {
         always {
             echo "Nettoyage de la session..."
             sh 'docker logout || true'
             sh 'rm -f get-pip.py'
         }
-
         success {
             echo "SUCCESS 🚀 L'application Spam Detection a été entraînée, scannée, signée et déployée !"
+            // Capture le rapport directement à la racine
+            archiveArtifacts artifacts: 'trivy-report.html', allowEmptyArchive: false
         }
-
         failure {
-            echo "FAILED ❌ Le pipeline a échoué. Regarde les logs de l'étape en rouge."
+            echo "FAILED ❌ Le pipeline a échoué."
         }
     }
 }
